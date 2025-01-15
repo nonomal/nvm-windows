@@ -5,16 +5,20 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"net"
 	"net/http"
 	"net/url"
 	"nvm/arch"
 	"nvm/file"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
+
+	"nvm/utility"
 
 	"archive/zip"
 
@@ -22,6 +26,7 @@ import (
 	fs "github.com/coreybutler/go-fsutil"
 )
 
+var nvmversion = ""
 var client = &http.Client{}
 var nodeBaseAddress = "https://nodejs.org/dist/"
 var npmBaseAddress = "https://github.com/npm/cli/archive/"
@@ -66,6 +71,55 @@ func GetFullNpmUrl(path string) string {
 	return npmBaseAddress + path
 }
 
+func IsLocalIPv6() (bool, error) {
+	conn, err := net.Dial("tcp", "[::1]:80")
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "no connection") {
+			return false, nil
+		}
+
+		return false, err
+	}
+	defer conn.Close()
+
+	return true, nil
+	// addrs, err := net.InterfaceAddrs()
+	// if err != nil {
+	// 	return false, err
+	// }
+
+	// for _, addr := range addrs {
+	// 	fmt.Println(addr.String())
+	// 	if strings.Contains(addr.String(), ":") {
+	// 		return true, nil
+	// 	}
+	// }
+
+	// return false, nil
+}
+
+// Returns whether the address can be pinged and whether it is using IPv6 or not
+func Ping(url string) bool {
+	req, err := http.NewRequest("HEAD", url, nil)
+	if err != nil {
+		fmt.Println(err)
+		return false
+	}
+
+	req.Header.Set("User-Agent", "NVM for Windows")
+
+	response, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+
+	if response.StatusCode == 200 {
+		return true
+	}
+
+	return false
+}
+
 func Download(url string, target string, version string) bool {
 	output, err := os.Create(target)
 	if err != nil {
@@ -80,12 +134,12 @@ func Download(url string, target string, version string) bool {
 		return false
 	}
 
-	// TODO: Add version to user agent
-	req.Header.Set("User-Agent", "NVM for Windows")
+	req.Header.Set("User-Agent", fmt.Sprintf("NVM for Windows %s", nvmversion))
 
 	response, err := client.Do(req)
 	if err != nil {
 		fmt.Println("Error while downloading", url, "-", err)
+		return false
 	}
 	defer response.Body.Close()
 	c := make(chan os.Signal, 2)
@@ -115,7 +169,7 @@ func Download(url string, target string, version string) bool {
 	} else {
 		_, err = io.Copy(output, response.Body)
 		if err != nil {
-			fmt.Println("Error while downloading", url, "-", err)
+			fmt.Printf("Error while downloading %s: %v\n", url, err)
 		}
 	}
 
@@ -162,6 +216,7 @@ func Download(url string, target string, version string) bool {
 }
 
 func GetNodeJS(root string, v string, a string, append bool) bool {
+	utility.DebugLogf("running GetNodeJS with root: %v, v%v, arch: %v, append: %v", root, v, a, append)
 	a = arch.Validate(a)
 
 	vpre := ""
@@ -180,9 +235,17 @@ func GetNodeJS(root string, v string, a string, append bool) bool {
 		} else {
 			vpre = "x64/"
 		}
+	} else if a == "arm64" {
+		if main > 0 {
+			vpre = "win-arm64/"
+		} else {
+			vpre = "arm64/"
+		}
 	}
 
 	url := getNodeUrl(v, vpre, a, append)
+
+	utility.DebugLogf("download url: %v", url)
 
 	if url == "" {
 		//No url should mean this version/arch isn't available
@@ -196,9 +259,11 @@ func GetNodeJS(root string, v string, a string, append bool) bool {
 		fmt.Println("Downloading node.js version " + v + " (" + a + "-bit)... ")
 
 		if Download(url, fileName, v) {
+			utility.DebugLog("download succeeded")
 			// Extract the zip file
 			if strings.HasSuffix(url, ".zip") {
 				fmt.Println("Extracting node and npm...")
+				utility.DebugLogf("extracting %v to %v", fileName, root+"\\v"+v)
 				err := unzip(fileName, root+"\\v"+v)
 				if err != nil {
 					fmt.Println("Error extracting from Node archive: " + err.Error())
@@ -207,6 +272,7 @@ func GetNodeJS(root string, v string, a string, append bool) bool {
 					if err != nil {
 						fmt.Printf("Failed to remove %v after failed extraction. Please remove manually.", fileName)
 					}
+					utility.DebugLogf("removed %v", fileName)
 
 					return false
 				}
@@ -215,21 +281,36 @@ func GetNodeJS(root string, v string, a string, append bool) bool {
 				if err != nil {
 					fmt.Printf("Failed to remove %v after successful extraction. Please remove manually.", fileName)
 				}
+				utility.DebugLogf("removed %v", fileName)
 
 				zip := root + "\\v" + v + "\\" + strings.Replace(filepath.Base(url), ".zip", "", 1)
+				utility.DebugLogf("moving %v to %v", zip, root+"\\v"+v)
 				err = fs.Move(zip, root+"\\v"+v, true)
 				if err != nil {
 					fmt.Println("ERROR moving file: " + err.Error())
 				}
+				utility.DebugLog("move succeeded")
 
 				err = os.RemoveAll(zip)
 				if err != nil {
 					fmt.Printf("Failed to remove %v after successful extraction. Please remove manually.", zip)
 				}
+				utility.DebugLogf("removed %v", zip)
+
+				utility.DebugFn(func() {
+					cmd := exec.Command("cmd", "/C", "dir", root+"\\v"+v)
+					out, err := cmd.CombinedOutput()
+					if err != nil {
+						utility.DebugLog(err.Error())
+					} else {
+						utility.DebugLog(string(out))
+					}
+				})
 			}
 			fmt.Println("Complete")
 			return true
 		} else {
+			utility.DebugLog("download failed")
 			return false
 		}
 	}
@@ -239,8 +320,11 @@ func GetNodeJS(root string, v string, a string, append bool) bool {
 
 func GetNpm(root string, v string) bool {
 	url := GetFullNpmUrl("v" + v + ".zip")
+
 	// temp directory to download the .zip file
 	tempDir := root + "\\temp"
+
+	utility.DebugLogf("downloading npm from %v to %v", url, tempDir)
 
 	// if the temp directory doesn't exist, create it
 	if !file.Exists(tempDir) {
@@ -255,30 +339,33 @@ func GetNpm(root string, v string) bool {
 
 	fmt.Printf("Downloading npm version " + v + "... ")
 	if Download(url, fileName, v) {
+		utility.DebugLog("npm download succeeded")
 		fmt.Printf("Complete\n")
 		return true
 	} else {
+		utility.DebugLog("npm download failed")
 		return false
 	}
 }
 
-func GetRemoteTextFile(url string) string {
+func GetRemoteTextFile(url string) (string, error) {
 	response, httperr := client.Get(url)
 	if httperr != nil {
-		fmt.Println("\nCould not retrieve " + url + ".\n\n")
-		fmt.Printf("%s", httperr)
-		os.Exit(1)
-	} else {
-		defer response.Body.Close()
-		contents, readerr := ioutil.ReadAll(response.Body)
-		if readerr != nil {
-			fmt.Printf("%s", readerr)
-			os.Exit(1)
-		}
-		return string(contents)
+		return "", fmt.Errorf("Could not retrieve %v: %v", url, httperr)
 	}
-	os.Exit(1)
-	return ""
+
+	if response.StatusCode != 200 {
+		return "", fmt.Errorf("Error retrieving \"%s\": HTTP Status %v\n", url, response.StatusCode)
+	}
+
+	defer response.Body.Close()
+
+	contents, readerr := ioutil.ReadAll(response.Body)
+	if readerr != nil {
+		return "", fmt.Errorf("error reading HTTP request body: %v", readerr)
+	}
+
+	return string(contents), nil
 }
 
 func IsNode64bitAvailable(v string) bool {
@@ -298,14 +385,38 @@ func IsNode64bitAvailable(v string) bool {
 	return true
 }
 
+func IsNodeArm64bitAvailable(v string) bool {
+	if v == "latest" {
+		return true
+	}
+
+	// Anything below version 19.9 doesn't have a arm64 bit version
+	vers := strings.Fields(strings.Replace(v, ".", " ", -1))
+	main, _ := strconv.ParseInt(vers[0], 0, 0)
+	minor, _ := strconv.ParseInt(vers[1], 0, 0)
+	fmt.Println("main " + strconv.FormatInt(main, 10) + " minor " + strconv.FormatInt(minor, 10))
+	if main < 19 {
+		return false
+	}
+	if main == 19 && minor < 9 {
+		return false
+	}
+
+	// TODO: fixme. Assume a 64 bit version exists
+	return true
+}
+
 func getNodeUrl(v string, vpre string, arch string, append bool) string {
 	a := "x86"
+	if arch == "arm64" {
+		a = "arm64"
+	}
 	if arch == "64" {
 		a = "x64"
 	}
 
 	//url := "http://nodejs.org/dist/v"+v+"/" + vpre + "/node.exe"
-	url := GetFullNodeUrl("v" + v + "/" + vpre + "/node.exe")
+	url := GetFullNodeUrl("v" + v + "/" + vpre + "node.exe")
 
 	if !append {
 		version, err := semver.Make(v)
